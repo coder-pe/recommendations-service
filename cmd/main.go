@@ -17,6 +17,7 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/qhato/recommendations-service/internal/config"
 	"github.com/qhato/recommendations-service/internal/gorse"
+	"github.com/qhato/recommendations-service/internal/idempotency"
 	"github.com/qhato/recommendations-service/internal/ingest"
 )
 
@@ -31,9 +32,44 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	var idempotencyStore idempotency.Store
+	if cfg.IdempotencyEnabled {
+		store, err := idempotency.NewRedisStore(
+			cfg.IdempotencyRedisURL,
+			time.Duration(cfg.IdempotencyTTLHours)*time.Hour,
+			cfg.IdempotencyKeyPrefix,
+		)
+		if err != nil {
+			log.Printf("idempotency disabled due to invalid redis config: %v", err)
+		} else {
+			idempotencyStore = store
+			log.Printf("idempotency enabled with redis store")
+		}
+	}
+
 	if cfg.KafkaEnabled && cfg.GorseEnabled {
-		h := ingest.NewHandler(gorseClient, cfg.TenantNamespaceEnable)
-		consumer := ingest.NewConsumer(cfg.KafkaBrokers, cfg.KafkaGroupID, cfg.TopicList(), h)
+		dlq := ingest.NewDLQPublisher(cfg.KafkaBrokers, cfg.KafkaTopicDLQ)
+		if dlq != nil {
+			defer dlq.Close()
+		}
+
+		h := ingest.NewHandler(
+			gorseClient,
+			cfg.TenantNamespaceEnable,
+			idempotencyStore,
+			cfg.IdempotencySkipIfNoEvent,
+			cfg.ContractRequireEventID,
+			cfg.ContractRequireEventVersion,
+		)
+		consumer := ingest.NewConsumer(
+			cfg.KafkaBrokers,
+			cfg.KafkaGroupID,
+			cfg.TopicList(),
+			h,
+			dlq,
+			cfg.KafkaConsumerMaxAttempts,
+			time.Duration(cfg.KafkaConsumerRetryBaseMS)*time.Millisecond,
+		)
 		go func() {
 			if err := consumer.Start(ctx); err != nil && err != context.Canceled {
 				log.Printf("kafka consumer stopped with error: %v", err)
@@ -64,6 +100,14 @@ func main() {
 			"checks": fiber.Map{
 				"kafkaEnabled": cfg.KafkaEnabled,
 				"gorseEnabled": cfg.GorseEnabled,
+				"idempotency": fiber.Map{
+					"enabled": cfg.IdempotencyEnabled && idempotencyStore != nil,
+				},
+				"contract": fiber.Map{
+					"requireEventId":      cfg.ContractRequireEventID,
+					"requireEventVersion": cfg.ContractRequireEventVersion,
+				},
+				"dlqTopic": cfg.KafkaTopicDLQ,
 			},
 		}
 

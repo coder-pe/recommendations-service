@@ -25,6 +25,9 @@ type Config struct {
 	KafkaTopicStoreProductUpsert string
 	KafkaTopicReservationStatus  string
 	KafkaTopicFeedback           string
+	KafkaTopicDLQ                string
+	KafkaConsumerMaxAttempts     int
+	KafkaConsumerRetryBaseMS     int
 
 	GorseEnabled          bool
 	GorseEndpoint         string
@@ -32,6 +35,15 @@ type Config struct {
 	GorseDefaultN         int
 	GorseTimeoutSeconds   int
 	TenantNamespaceEnable bool
+
+	IdempotencyEnabled       bool
+	IdempotencyRedisURL      string
+	IdempotencyTTLHours      int
+	IdempotencyKeyPrefix     string
+	IdempotencySkipIfNoEvent bool
+
+	ContractRequireEventID      bool
+	ContractRequireEventVersion bool
 }
 
 func Load() *Config {
@@ -54,13 +66,25 @@ func Load() *Config {
 		KafkaTopicStoreProductUpsert: getenv("KAFKA_TOPIC_STORE_PRODUCT_UPSERT", "qhato.inventory.store_product.upsert"),
 		KafkaTopicReservationStatus:  getenv("KAFKA_TOPIC_RESERVATION_STATUS_CHANGED", "qhato.reservations.status_changed"),
 		KafkaTopicFeedback:           getenv("KAFKA_TOPIC_FEEDBACK", "qhato.recommendations.feedback"),
+		KafkaTopicDLQ:                getenv("KAFKA_TOPIC_DLQ", "qhato.recommendations.dlq"),
+		KafkaConsumerMaxAttempts:     getenvInt("KAFKA_CONSUMER_MAX_ATTEMPTS", 3),
+		KafkaConsumerRetryBaseMS:     getenvInt("KAFKA_CONSUMER_RETRY_BASE_MS", 500),
 
 		GorseEnabled:          getenvBool("GORSE_ENABLED", true),
-		GorseEndpoint:         strings.TrimRight(getenv("GORSE_ENDPOINT", "http://127.0.0.1:8090"), "/"),
+		GorseEndpoint:         strings.TrimRight(getenv("GORSE_ENDPOINT", "http://127.0.0.1:8089"), "/"),
 		GorseAPIKey:           getenv("GORSE_API_KEY", ""),
 		GorseDefaultN:         getenvInt("GORSE_RECOMMEND_DEFAULT_N", 20),
 		GorseTimeoutSeconds:   getenvInt("GORSE_TIMEOUT_SECONDS", 5),
 		TenantNamespaceEnable: getenvBool("TENANT_NAMESPACE_ENABLED", true),
+
+		IdempotencyEnabled:       getenvBool("IDEMPOTENCY_ENABLED", true),
+		IdempotencyRedisURL:      getenv("IDEMPOTENCY_REDIS_URL", "redis://127.0.0.1:6379/5"),
+		IdempotencyTTLHours:      getenvInt("IDEMPOTENCY_TTL_HOURS", 168),
+		IdempotencyKeyPrefix:     getenv("IDEMPOTENCY_KEY_PREFIX", "qhato:recommendations:ingest"),
+		IdempotencySkipIfNoEvent: getenvBool("IDEMPOTENCY_SKIP_IF_NO_EVENT_ID", false),
+
+		ContractRequireEventID:      getenvBool("CONTRACT_REQUIRE_EVENT_ID", true),
+		ContractRequireEventVersion: getenvBool("CONTRACT_REQUIRE_EVENT_VERSION", true),
 	}
 }
 

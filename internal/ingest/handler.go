@@ -9,26 +9,75 @@ import (
 	"time"
 
 	"github.com/qhato/recommendations-service/internal/gorse"
+	"github.com/qhato/recommendations-service/internal/idempotency"
 )
 
 type Handler struct {
 	gorse                 *gorse.Client
 	tenantNamespaceEnable bool
+	idempotency           idempotency.Store
+	skipIfNoEventID       bool
+	requireEventID        bool
+	requireEventVersion   bool
 }
 
-func NewHandler(gorseClient *gorse.Client, tenantNamespaceEnable bool) *Handler {
-	return &Handler{gorse: gorseClient, tenantNamespaceEnable: tenantNamespaceEnable}
+func NewHandler(
+	gorseClient *gorse.Client,
+	tenantNamespaceEnable bool,
+	idempotencyStore idempotency.Store,
+	skipIfNoEventID bool,
+	requireEventID bool,
+	requireEventVersion bool,
+) *Handler {
+	return &Handler{
+		gorse:                 gorseClient,
+		tenantNamespaceEnable: tenantNamespaceEnable,
+		idempotency:           idempotencyStore,
+		skipIfNoEventID:       skipIfNoEventID,
+		requireEventID:        requireEventID,
+		requireEventVersion:   requireEventVersion,
+	}
 }
 
 func (h *Handler) Handle(ctx context.Context, topic string, payload []byte) error {
 	var event map[string]any
 	if err := json.Unmarshal(payload, &event); err != nil {
-		return err
+		return newPermanentError(err)
+	}
+
+	eventID := strings.TrimSpace(asString(event["eventId"]))
+	if h.requireEventID && eventID == "" {
+		return newPermanentError(fmt.Errorf("missing eventId"))
+	}
+	eventVersion := strings.TrimSpace(asString(event["eventVersion"]))
+	if h.requireEventVersion && eventVersion == "" {
+		return newPermanentError(fmt.Errorf("missing eventVersion"))
+	}
+	if eventVersion != "" && !strings.HasPrefix(eventVersion, "1.") {
+		return newPermanentError(fmt.Errorf("unsupported eventVersion: %s", eventVersion))
+	}
+
+	if h.idempotency != nil {
+		if eventID == "" && h.skipIfNoEventID {
+			return nil
+		}
+		if eventID != "" {
+			first, err := h.idempotency.TryMarkProcessed(ctx, topic+"::"+eventID)
+			if err != nil {
+				return err
+			}
+			if !first {
+				return nil
+			}
+		}
 	}
 
 	body := extractMap(event, "payload")
 	if body == nil {
 		body = event
+	}
+	if err := h.validateTopicPayload(topic, body); err != nil {
+		return newPermanentError(err)
 	}
 
 	switch topic {
@@ -46,6 +95,41 @@ func (h *Handler) Handle(ctx context.Context, topic string, payload []byte) erro
 		log.Printf("[ingest] unsupported topic=%s", topic)
 		return nil
 	}
+}
+
+func (h *Handler) validateTopicPayload(topic string, body map[string]any) error {
+	switch topic {
+	case "qhato.users.user_registered":
+		if firstNonEmpty(asString(body["userId"]), asString(body["id"])) == "" {
+			return fmt.Errorf("invalid payload: missing userId")
+		}
+	case "qhato.catalog.product.created", "qhato.catalog.product.updated":
+		if firstNonEmpty(asString(body["productId"]), asString(body["id"])) == "" {
+			return fmt.Errorf("invalid payload: missing productId")
+		}
+	case "qhato.inventory.store_product.upsert":
+		if asString(body["storeProductId"]) == "" {
+			return fmt.Errorf("invalid payload: missing storeProductId")
+		}
+		if asString(body["productId"]) == "" {
+			return fmt.Errorf("invalid payload: missing productId")
+		}
+		if asString(body["storeId"]) == "" {
+			return fmt.Errorf("invalid payload: missing storeId")
+		}
+	case "qhato.reservations.status_changed":
+		if asString(body["userId"]) == "" {
+			return fmt.Errorf("invalid payload: missing userId")
+		}
+		if asString(body["newStatus"]) == "" {
+			return fmt.Errorf("invalid payload: missing newStatus")
+		}
+	case "qhato.recommendations.feedback":
+		if asString(body["userId"]) == "" || asString(body["itemId"]) == "" {
+			return fmt.Errorf("invalid payload: missing userId/itemId")
+		}
+	}
+	return nil
 }
 
 func (h *Handler) handleUserRegistered(ctx context.Context, body map[string]any) error {

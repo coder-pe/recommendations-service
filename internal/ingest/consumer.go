@@ -6,23 +6,45 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	kafka "github.com/segmentio/kafka-go"
 )
 
 type Consumer struct {
-	brokers []string
-	groupID string
-	topics  []string
-	handle  *Handler
+	brokers         []string
+	groupID         string
+	topics          []string
+	handle          *Handler
+	dlq             *DLQPublisher
+	maxAttempts     int
+	retryBase       time.Duration
+	dlqForTransient bool
 }
 
-func NewConsumer(brokers []string, groupID string, topics []string, h *Handler) *Consumer {
+func NewConsumer(
+	brokers []string,
+	groupID string,
+	topics []string,
+	h *Handler,
+	dlq *DLQPublisher,
+	maxAttempts int,
+	retryBase time.Duration,
+) *Consumer {
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	if retryBase <= 0 {
+		retryBase = 500 * time.Millisecond
+	}
 	return &Consumer{
-		brokers: brokers,
-		groupID: groupID,
-		topics:  topics,
-		handle:  h,
+		brokers:     brokers,
+		groupID:     groupID,
+		topics:      topics,
+		handle:      h,
+		dlq:         dlq,
+		maxAttempts: maxAttempts,
+		retryBase:   retryBase,
 	}
 }
 
@@ -64,8 +86,8 @@ func (c *Consumer) Start(ctx context.Context) error {
 					return
 				}
 
-				if err := c.handle.Handle(ctx, topic, msg.Value); err != nil {
-					log.Printf("[kafka] handler failed topic=%s offset=%d: %v", topic, msg.Offset, err)
+				if err := c.processMessage(ctx, topic, msg); err != nil {
+					log.Printf("[kafka] process failed topic=%s offset=%d: %v", topic, msg.Offset, err)
 				}
 				if err := r.CommitMessages(ctx, msg); err != nil {
 					log.Printf("[kafka] commit failed topic=%s offset=%d: %v", topic, msg.Offset, err)
@@ -85,4 +107,44 @@ func (c *Consumer) Start(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (c *Consumer) processMessage(ctx context.Context, topic string, msg kafka.Message) error {
+	var lastErr error
+	for attempt := 1; attempt <= c.maxAttempts; attempt++ {
+		err := c.handle.Handle(ctx, topic, msg.Value)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+
+		if IsPermanentError(err) {
+			if c.dlq != nil {
+				if dlqErr := c.dlq.Publish(ctx, msg, attempt, err); dlqErr != nil {
+					log.Printf("[kafka] dlq publish failed topic=%s offset=%d: %v", topic, msg.Offset, dlqErr)
+				} else {
+					log.Printf("[kafka] moved to dlq topic=%s offset=%d reason=permanent_error", topic, msg.Offset)
+				}
+			}
+			return err
+		}
+
+		if attempt < c.maxAttempts {
+			backoff := time.Duration(attempt) * c.retryBase
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+
+	if c.dlq != nil && lastErr != nil {
+		if dlqErr := c.dlq.Publish(ctx, msg, c.maxAttempts, lastErr); dlqErr != nil {
+			log.Printf("[kafka] dlq publish failed topic=%s offset=%d: %v", topic, msg.Offset, dlqErr)
+		} else {
+			log.Printf("[kafka] moved to dlq topic=%s offset=%d reason=max_attempts", topic, msg.Offset)
+		}
+	}
+	return lastErr
 }
