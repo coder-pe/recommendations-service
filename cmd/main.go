@@ -19,6 +19,7 @@ import (
 	"github.com/qhato/recommendations-service/internal/gorse"
 	"github.com/qhato/recommendations-service/internal/idempotency"
 	"github.com/qhato/recommendations-service/internal/ingest"
+	"github.com/qhato/recommendations-service/internal/middleware"
 )
 
 func main() {
@@ -132,10 +133,25 @@ func main() {
 	base.Get("/health", health)
 	api := base.Group(cfg.APIBasePath)
 
+	// Protege los endpoints privados con JWT. Si JWT_ENABLED está activo pero no se
+	// configuró JWT_SECRET, se aborta el arranque para no exponer datos sin auth.
+	if cfg.JWTEnabled {
+		if strings.TrimSpace(cfg.JWTSecretKey) == "" {
+			log.Fatal("JWT_ENABLED=true but JWT_SECRET is empty; refusing to start with unprotected endpoints")
+		}
+		api.Use(middleware.NewJWTMiddleware(cfg.JWTSecretKey))
+		log.Printf("JWT authentication enabled for %s%s", cfg.ContextPath, cfg.APIBasePath)
+	} else {
+		log.Printf("⚠️  JWT authentication DISABLED; private endpoints are unprotected")
+	}
+
 	api.Get("/users/:userId/home", func(c *fiber.Ctx) error {
 		userID := strings.TrimSpace(c.Params("userId"))
 		if userID == "" {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "userId is required"})
+		}
+		if claims, ok := middleware.GetClaims(c); ok && !claims.CanActOnUser(userID) {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "cannot access recommendations for another user"})
 		}
 		tenantCode := strings.TrimSpace(c.Query("tenantCode"))
 
@@ -182,6 +198,9 @@ func main() {
 		}
 		if strings.TrimSpace(req.UserID) == "" || strings.TrimSpace(req.ItemID) == "" {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "userId and itemId are required"})
+		}
+		if claims, ok := middleware.GetClaims(c); ok && !claims.CanActOnUser(req.UserID) {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "cannot submit feedback on behalf of another user"})
 		}
 		feedbackType := strings.TrimSpace(req.FeedbackType)
 		if feedbackType == "" {

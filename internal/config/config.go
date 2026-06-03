@@ -44,6 +44,9 @@ type Config struct {
 
 	ContractRequireEventID      bool
 	ContractRequireEventVersion bool
+
+	JWTEnabled   bool
+	JWTSecretKey string
 }
 
 func Load() *Config {
@@ -85,6 +88,9 @@ func Load() *Config {
 
 		ContractRequireEventID:      getenvBool("CONTRACT_REQUIRE_EVENT_ID", true),
 		ContractRequireEventVersion: getenvBool("CONTRACT_REQUIRE_EVENT_VERSION", true),
+
+		JWTEnabled:   getenvBool("JWT_ENABLED", true),
+		JWTSecretKey: getenv("JWT_SECRET_KEY", ""),
 	}
 }
 
